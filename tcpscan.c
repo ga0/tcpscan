@@ -9,7 +9,6 @@
 #include <pthread.h>
 
 static u_int32_t s_src_ipaddr;        /* ip address of this host */
-static int s_src_port = 0;
 static libnet_t *s_netctx;            /* libnet context */
 static int* s_ports;
 static int s_port_num = 0;
@@ -24,7 +23,7 @@ static int s_send_syn_thread_quit = 0;
 static unsigned int s_interval_us = 1000;
 static unsigned int s_max_wait_time = 5;
 static int s_netprefix_length = 0;
-const u_int32_t INIT_ISN = 11341;
+static const u_int32_t INIT_ISN = 11341;
 
 static void usage()
 {
@@ -193,7 +192,10 @@ void *send_thread(void *arg)
     {
         for (u_int32_t i = 0; i < s_total_ip; ++i)
         {
-            send_syn(s_src_ipaddr, s_src_port, htonl(get_ip(i)), s_ports[p]);
+            send_syn(s_src_ipaddr, 
+                    libnet_get_prand(LIBNET_PRu16), 
+                    htonl(get_ip(i)), 
+                    s_ports[p]);
             usleep(s_interval_us);
         }
     }
@@ -314,9 +316,6 @@ int main (int argc, char *argv[])
 
     init_task(argv[optind]);
 
-    if (!s_src_port)
-        s_src_port = libnet_get_prand(LIBNET_PRu16);
-
     /* get the ip address of the device */
     if ((s_src_ipaddr = libnet_get_ipaddr4(s_netctx)) == -1)
     {
@@ -324,7 +323,7 @@ int main (int argc, char *argv[])
         exit(1);
     }
 
-    snprintf(filter, sizeof filter, "(dst host %s) && (dst port %d)", libnet_addr2name4(s_src_ipaddr, LIBNET_DONT_RESOLVE), s_src_port);
+    snprintf(filter, sizeof filter, "(dst host %s) && tcp[8:4] == %d", libnet_addr2name4(s_src_ipaddr, LIBNET_DONT_RESOLVE), INIT_ISN + 1);
 
     /* get the device we are using for libpcap */
     if ((device = libnet_getdevice(s_netctx)) == NULL)
