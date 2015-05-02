@@ -186,7 +186,8 @@ static void send_syn(in_addr_t src_ipaddr, int src_port, in_addr_t dst_ipaddr, i
 
 void *send_thread(void *arg)
 {
-    usleep(10);
+    /* wait a while to make sure the main thread is ready to receive */
+    usleep(10000);
 
     for (int p = 0; p < s_port_num; ++p)
     {
@@ -196,7 +197,8 @@ void *send_thread(void *arg)
                     libnet_get_prand(LIBNET_PRu16), 
                     htonl(get_ip(i)), 
                     s_ports[p]);
-            usleep(s_interval_us);
+            if (s_interval_us)
+                usleep(s_interval_us);
         }
     }
 
