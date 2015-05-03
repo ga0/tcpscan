@@ -6,6 +6,7 @@
 #include <pcap.h>
 #include <netinet/tcp.h>
 #include <netinet/ip.h>
+#include <net/ethernet.h>
 #include <pthread.h>
 
 static u_int32_t s_src_ipaddr;        /* ip address of this host */
@@ -24,6 +25,11 @@ static unsigned int s_interval_us = 1000;
 static unsigned int s_max_wait_time = 5;
 static int s_netprefix_length = 0;
 static const u_int32_t INIT_ISN = 11341;
+static const char* s_user_specified_device = NULL;
+static const char* s_device_name;
+static int s_gateway_macaddr_set = 0;
+static int s_require_update_netctx = 0;
+static uint8_t s_gateway_macaddr[6];
 
 static void usage()
 {
@@ -35,11 +41,12 @@ static void usage()
            "Example: tcpscan -p80,443 -ieth0 192.168.1.0/24\n");
 }
 
-static void init_task(char* strip)
+static void init_task(char* str_ip)
 {
     char* p_slash = NULL;
     in_addr_t ipaddr;
-    if ((p_slash = strchr(strip, '/')) != NULL)
+    int i;
+    if ((p_slash = strchr(str_ip, '/')) != NULL)
     {
         u_int32_t netmask = 0xffffffff;
         s_netprefix_length = atoi(p_slash+1);
@@ -49,14 +56,14 @@ static void init_task(char* strip)
             exit(1);
         }
         memset(netprefix, 0, 16);
-        strncpy(netprefix, strip, p_slash - strip);
+        strncpy(netprefix, str_ip, p_slash - str_ip);
         if ((ipaddr = libnet_name2addr4(s_netctx, netprefix, LIBNET_RESOLVE)) == -1)
         {
             fprintf(stderr, "Invalid address: %s(%s)\n", libnet_geterror(s_netctx), netprefix);
             exit(1);
         }
         netmask &= ~1;
-        for (int i = 1; i < 32-s_netprefix_length; ++i)
+        for (i = 1; i < 32-s_netprefix_length; ++i)
         {
             netmask <<= 1;
             netmask &= ~1;
@@ -67,9 +74,9 @@ static void init_task(char* strip)
     }
     else
     {
-        if ((ipaddr = libnet_name2addr4(s_netctx, strip, LIBNET_RESOLVE)) == -1)
+        if ((ipaddr = libnet_name2addr4(s_netctx, str_ip, LIBNET_RESOLVE)) == -1)
         {
-            fprintf(stderr, "Invalid address: %s(%s)\n", libnet_geterror(s_netctx), strip);
+            fprintf(stderr, "Invalid address: %s(%s)\n", libnet_geterror(s_netctx), str_ip);
             exit(1);
         }
         s_ipaddr_begin = ntohl(ipaddr);
@@ -81,9 +88,10 @@ static void init_task(char* strip)
 static u_int32_t get_ip(u_int32_t index)
 {
     u_int32_t x = 0;
-    /* reverse bits of index */
+    int i;
+    // reverse bits of index
     int n = 32 - s_netprefix_length;
-    for (int i = 0; i < n; ++i)
+    for (i = 0; i < n; ++i)
     {
         x |= ((index & (0x01 << i)) >> i) << (n-i-1);
     }
@@ -94,6 +102,23 @@ static void packet_handler(u_char* user, const struct pcap_pkthdr* header, const
 {
     struct tcphdr *tcp = (struct tcphdr *) (packet + LIBNET_IPV4_H + LIBNET_ETH_H);
     struct ip *ip = (struct ip *) (packet + LIBNET_ETH_H);
+    struct ether_header* ether = (struct ether_header*) packet;
+
+    if (!s_gateway_macaddr_set)
+    {
+        char macaddr_str[20];
+        sprintf(macaddr_str, "%02x:%02x:%02x:%02x:%02x:%02x",
+            ether->ether_shost[0],
+            ether->ether_shost[1],
+            ether->ether_shost[2],
+            ether->ether_shost[3],
+            ether->ether_shost[4],
+            ether->ether_shost[5]);
+        printf("Gateway MAC addr: %s\n", macaddr_str);
+        memcpy(s_gateway_macaddr, ether->ether_shost, 6);
+        s_gateway_macaddr_set = 1;
+        s_require_update_netctx = 1;
+    }
 
     if (ntohl(tcp->th_ack) != INIT_ISN + 1)
     {
@@ -119,7 +144,7 @@ static void packet_handler(u_char* user, const struct pcap_pkthdr* header, const
 
 static void send_syn(in_addr_t src_ipaddr, int src_port, in_addr_t dst_ipaddr, int dst_port)
 {
-    libnet_ptag_t tcp = 0, ipv4 = 0;    /* libnet protocol blocks */
+    libnet_ptag_t tcp = 0, ipv4 = 0, ether = 0;    /* libnet protocol blocks */
 
     unsigned char mss_opt[5] = {0x02,0x04,0x05,0xb4,0x00};
     tcp = libnet_build_tcp_options(mss_opt,
@@ -171,8 +196,21 @@ static void send_syn(in_addr_t src_ipaddr, int src_port, in_addr_t dst_ipaddr, i
 
     if (ipv4 == -1)
     {
-        fprintf(stderr, "Unable to build IPv4 header: %s\n", libnet_geterror (s_netctx));
+        fprintf(stderr, "Unable to build IPv4 header: %s\n", libnet_geterror(s_netctx));
         exit(1);
+    }
+    
+    if (s_gateway_macaddr_set)
+    {
+        ether = libnet_autobuild_ethernet(s_gateway_macaddr,
+            ETHERTYPE_IP,
+            s_netctx);
+            
+        if (ether == -1)
+        {
+            fprintf(stderr, "Unable to build Ether header: %s\n", libnet_geterror(s_netctx));
+            exit(1);
+        }
     }
 
     /* write the packet */
@@ -184,15 +222,51 @@ static void send_syn(in_addr_t src_ipaddr, int src_port, in_addr_t dst_ipaddr, i
     libnet_clear_packet(s_netctx);
 }
 
-void *send_thread(void *arg)
+static void init_net_context(int inj_type)
 {
+    char libnet_errbuf[LIBNET_ERRBUF_SIZE];    /* libnet error messages */
+    s_netctx = libnet_init(inj_type, s_user_specified_device, libnet_errbuf);
+    if (s_netctx == NULL)
+    {
+        fprintf(stderr, "Error opening context (device: %s): %s\n", s_device_name, libnet_errbuf);
+        exit (1);
+    }
+    libnet_seed_prand(s_netctx);
+
+    /* get the ip address of the device */
+    if ((s_src_ipaddr = libnet_get_ipaddr4(s_netctx)) == -1)
+    {
+        fprintf (stderr, "Error getting IP: %s\n", libnet_geterror(s_netctx));
+        exit(1);
+    }
+
+    /* get the device we are using for libpcap */
+    if ((s_device_name = libnet_getdevice(s_netctx)) == NULL)
+    {
+        fprintf(stderr, "Device is NULL. Packet capture may be broken\n");
+    }
+    
+    printf("Device: %s\n", s_device_name);
+}
+
+static void *send_thread(void *arg)
+{
+    int p;
+    u_int32_t i;
     /* wait a while to make sure the main thread is ready to receive */
     usleep(10000);
 
-    for (int p = 0; p < s_port_num; ++p)
+    for (p = 0; p < s_port_num; ++p)
     {
-        for (u_int32_t i = 0; i < s_total_ip; ++i)
+        for ( i = 0; i < s_total_ip; ++i)
         {
+            if (s_require_update_netctx)
+            {
+                libnet_destroy(s_netctx);
+                init_net_context(LIBNET_LINK);
+                printf("Gateway MAC addr set\n");
+                s_require_update_netctx = 0;
+            }
             send_syn(s_src_ipaddr, 
                     libnet_get_prand(LIBNET_PRu16), 
                     htonl(get_ip(i)), 
@@ -211,23 +285,23 @@ void *send_thread(void *arg)
 
 int main (int argc, char *argv[])
 {
-    const char *device = NULL;        /* device for sniffing/sending */
+    //const char *device = NULL;        /* device for sniffing/sending */
     char o;            /* for option processing */
-    char libnet_errbuf[LIBNET_ERRBUF_SIZE];    /* libnet error messages */
     char libpcap_errbuf[PCAP_ERRBUF_SIZE];    /* pcap error messages */
     pcap_t *handle;        /* libpcap handle */
     bpf_u_int32 netp, maskp;    /* netmask and ip */
     char filter[256];
     struct bpf_program fp;    /* compiled filter */
     time_t tv;
-
+    int i;
+    
     while ((o = getopt(argc, argv, "u:i:t:p:")) > 0)
     {
         switch (o)
         {
             case 'i':
             {
-                device = optarg;
+                s_user_specified_device = optarg;
                 break;
             }
             case 't':
@@ -302,63 +376,41 @@ int main (int argc, char *argv[])
         int default_ports[] = {21, 22, 23, 80, 110, 443};
         s_port_num = (sizeof default_ports) / (sizeof (int));
         s_ports = (int*) malloc(s_port_num * (sizeof (int)));
-        for (int i = 0; i < s_port_num; ++i)
+        for (i = 0; i < s_port_num; ++i)
         {
             s_ports[i] = default_ports[i];
         }
     }
 
-    s_netctx = libnet_init(LIBNET_RAW4, device, libnet_errbuf);
-    if (s_netctx == NULL)
-    {
-        fprintf(stderr, "Error opening context: %s\n", libnet_errbuf);
-        exit (1);
-    }
-    libnet_seed_prand(s_netctx);
-
+    init_net_context(LIBNET_RAW4);
     init_task(argv[optind]);
-
-    /* get the ip address of the device */
-    if ((s_src_ipaddr = libnet_get_ipaddr4(s_netctx)) == -1)
-    {
-        fprintf (stderr, "Error getting IP: %s\n", libnet_geterror(s_netctx));
-        exit(1);
-    }
-
     snprintf(filter, sizeof filter, "(dst host %s) && tcp[8:4] == %d", libnet_addr2name4(s_src_ipaddr, LIBNET_DONT_RESOLVE), INIT_ISN + 1);
-
-    /* get the device we are using for libpcap */
-    if ((device = libnet_getdevice(s_netctx)) == NULL)
-    {
-        fprintf(stderr, "Device is NULL. Packet capture may be broken\n");
-    }
-
-    printf("Device: %s, IP: %s\n", device, libnet_addr2name4(s_src_ipaddr, LIBNET_DONT_RESOLVE));
+    printf("Device: %s, IP: %s\n", s_device_name, libnet_addr2name4(s_src_ipaddr, LIBNET_DONT_RESOLVE));
 
     /* open the device with pcap */
-    if ((handle = pcap_open_live(device, 1500, 0, 2000, libpcap_errbuf)) == NULL)
+    if ((handle = pcap_open_live(s_device_name, 1500, 0, 2000, libpcap_errbuf)) == NULL)
     {
         fprintf(stderr, "Error opening pcap: %s\n", libpcap_errbuf);
         exit(1);
     }
-    if ((pcap_setnonblock(handle, 1, libnet_errbuf)) == -1)
+    if ((pcap_setnonblock(handle, 1, libpcap_errbuf)) == -1)
     {
         fprintf(stderr, "Error setting nonblocking: %s\n", libpcap_errbuf);
         exit(1);
     }
-    if (pcap_lookupnet(device, &netp, &maskp, libpcap_errbuf) == -1)
+    if (pcap_lookupnet(s_device_name, &netp, &maskp, libpcap_errbuf) == -1)
     {
         fprintf(stderr, "Net lookup error: %s\n", libpcap_errbuf);
         exit(1);
     }
     if (pcap_compile(handle, &fp, filter, 0, maskp) == -1)
     {
-        fprintf(stderr, "BPF error: %s\n", pcap_geterr (handle));
+        fprintf(stderr, "BPF error: %s\n", pcap_geterr(handle));
         exit(1);
     }
     if (pcap_setfilter(handle, &fp) == -1)
     {
-        fprintf(stderr, "Error setting BPF: %s\n", pcap_geterr (handle));
+        fprintf(stderr, "Error setting BPF: %s\n", pcap_geterr(handle));
         exit(1);
     }
 
@@ -374,7 +426,7 @@ int main (int argc, char *argv[])
 
     while (s_port_scanned < s_port_num * s_total_ip)
     {
-        int ret = pcap_dispatch(handle, s_port_num, packet_handler, NULL);
+        int ret = pcap_dispatch(handle, 10, packet_handler, NULL);
         if (ret > 0)
             s_port_scanned += ret;
         if (s_send_syn_thread_quit)
