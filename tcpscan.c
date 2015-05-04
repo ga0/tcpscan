@@ -24,7 +24,7 @@ static int s_send_syn_thread_quit = 0;
 static unsigned int s_interval_us = 0;
 static unsigned int s_max_wait_time = 5;
 static int s_netprefix_length = 0;
-static u_int32_t INIT_ISN = 0;
+static u_int32_t TCP_ISN = 0;
 static const char* s_user_specified_device = NULL;
 static const char* s_device_name;
 static int s_gateway_macaddr_set = 0;
@@ -121,12 +121,6 @@ static void packet_handler(u_char* user, const struct pcap_pkthdr* header, const
         s_gateway_macaddr_set = 1;
     }
 
-    if (ntohl(tcp->th_ack) != INIT_ISN + 1)
-    {
-        printf("Seq error. %0x != %0x\n", ntohl(tcp->th_ack), INIT_ISN + 1);
-        return;
-    }
-
     if (tcp->th_flags == (TH_ACK | TH_RST)) //TODO: We need to consider the 'spliting handshake'
     {
         ++s_closed_port;
@@ -160,7 +154,7 @@ static void send_syn(in_addr_t src_ipaddr, int src_port, in_addr_t dst_ipaddr, i
     /* build the TCP header */
     s_tcp = libnet_build_tcp (src_port,    /* src port */
         dst_port,    /* destination port */
-        INIT_ISN,    /* sequence number */
+        TCP_ISN,    /* sequence number */
         0,    /* acknowledgement */
         TH_SYN,    /* control flags */
         1024,    /* window */
@@ -259,8 +253,6 @@ static void init_net_context(int inj_type)
     {
         fprintf(stderr, "Get device MAC address error: %s", libnet_geterror(s_netctx));
     }
-    
-    printf("Device: %s\n", s_device_name);
 }
 
 static void *send_thread(void *arg)
@@ -278,7 +270,6 @@ static void *send_thread(void *arg)
             {
                 libnet_destroy(s_netctx);
                 init_net_context(LIBNET_LINK);
-                printf("Gateway MAC addr set\n");
                 s_netctx_gateway_macaddr_set = 1;
             }
             send_syn(s_src_ipaddr, 
@@ -396,10 +387,10 @@ int main (int argc, char *argv[])
         }
     }
 
-    INIT_ISN = libnet_get_prand(LIBNET_PRu32);
+    TCP_ISN = libnet_get_prand(LIBNET_PRu32);
     init_net_context(LIBNET_RAW4);
     init_task(argv[optind]);
-    snprintf(filter, sizeof filter, "(dst host %s) && tcp[8:4] == %d", libnet_addr2name4(s_src_ipaddr, LIBNET_DONT_RESOLVE), INIT_ISN + 1);
+    snprintf(filter, sizeof filter, "(dst host %s) && tcp[8:4] == %d", libnet_addr2name4(s_src_ipaddr, LIBNET_DONT_RESOLVE), TCP_ISN + 1);
     printf("Device: %s, IP: %s\n", s_device_name, libnet_addr2name4(s_src_ipaddr, LIBNET_DONT_RESOLVE));
 
     /* open the device with pcap */
