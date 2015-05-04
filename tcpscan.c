@@ -21,15 +21,17 @@ static u_int32_t s_open_port = 0;
 static u_int32_t s_closed_port = 0;
 static u_int32_t s_sent_failed = 0;
 static int s_send_syn_thread_quit = 0;
-static unsigned int s_interval_us = 1000;
+static unsigned int s_interval_us = 0;
 static unsigned int s_max_wait_time = 5;
 static int s_netprefix_length = 0;
 static const u_int32_t INIT_ISN = 11341;
 static const char* s_user_specified_device = NULL;
 static const char* s_device_name;
 static int s_gateway_macaddr_set = 0;
-static int s_require_update_netctx = 0;
+static int s_netctx_gateway_macaddr_set = 0;
 static uint8_t s_gateway_macaddr[6];
+static libnet_ptag_t s_tcpopt = 0, s_tcp = 0, s_ipv4 = 0, s_ether = 0;    /* libnet protocol blocks */
+static uint8_t* s_src_macaddr = 0;
 
 static void usage()
 {
@@ -117,7 +119,6 @@ static void packet_handler(u_char* user, const struct pcap_pkthdr* header, const
         printf("Gateway MAC addr: %s\n", macaddr_str);
         memcpy(s_gateway_macaddr, ether->ether_shost, 6);
         s_gateway_macaddr_set = 1;
-        s_require_update_netctx = 1;
     }
 
     if (ntohl(tcp->th_ack) != INIT_ISN + 1)
@@ -144,22 +145,20 @@ static void packet_handler(u_char* user, const struct pcap_pkthdr* header, const
 
 static void send_syn(in_addr_t src_ipaddr, int src_port, in_addr_t dst_ipaddr, int dst_port)
 {
-    libnet_ptag_t tcp = 0, ipv4 = 0, ether = 0;    /* libnet protocol blocks */
-
     unsigned char mss_opt[5] = {0x02,0x04,0x05,0xb4,0x00};
-    tcp = libnet_build_tcp_options(mss_opt,
+    s_tcpopt = libnet_build_tcp_options(mss_opt,
         4,
         s_netctx,
-        0);
+        s_tcpopt);
 
-    if (tcp == -1)
+    if (s_tcpopt == -1)
     {
         fprintf(stderr, "Unable to build TCP options: %s\n", libnet_geterror(s_netctx));
         exit(1);
     }
 
     /* build the TCP header */
-    tcp = libnet_build_tcp (src_port,    /* src port */
+    s_tcp = libnet_build_tcp (src_port,    /* src port */
         dst_port,    /* destination port */
         INIT_ISN,    /* sequence number */
         0,    /* acknowledgement */
@@ -171,16 +170,16 @@ static void send_syn(in_addr_t src_ipaddr, int src_port, in_addr_t dst_ipaddr, i
         NULL,    /* payload */
         0,    /* payload length */
         s_netctx,    /* libnet context */
-        0);    /* protocol tag */
+        s_tcp);    /* protocol tag */
 
-    if (tcp == -1)
+    if (s_tcp == -1)
     {
         fprintf(stderr, "Unable to build TCP header: %s\n", libnet_geterror(s_netctx));
         exit(1);
     }
 
     /* build the IP header */
-    ipv4 = libnet_build_ipv4(LIBNET_TCP_H + LIBNET_IPV4_H + 4,    /* length */
+    s_ipv4 = libnet_build_ipv4(LIBNET_TCP_H + LIBNET_IPV4_H + 4,    /* length */
         0,    /* TOS */
         libnet_get_prand(LIBNET_PRu16),    /* IP ID */
         0,    /* frag offset */
@@ -192,21 +191,26 @@ static void send_syn(in_addr_t src_ipaddr, int src_port, in_addr_t dst_ipaddr, i
         NULL,    /* payload */
         0,    /* payload len */
         s_netctx,    /* libnet context */
-        0);    /* protocol tag */
+        s_ipv4);    /* protocol tag */
 
-    if (ipv4 == -1)
+    if (s_ipv4 == -1)
     {
         fprintf(stderr, "Unable to build IPv4 header: %s\n", libnet_geterror(s_netctx));
         exit(1);
     }
     
-    if (s_gateway_macaddr_set)
+    if (s_netctx_gateway_macaddr_set)
     {
-        ether = libnet_autobuild_ethernet(s_gateway_macaddr,
+        //printf("ether\n");
+        s_ether = libnet_build_ethernet(s_gateway_macaddr,
+            s_src_macaddr,
             ETHERTYPE_IP,
-            s_netctx);
+            NULL,
+            0,
+            s_netctx,
+            s_ether);
             
-        if (ether == -1)
+        if (s_ether == -1)
         {
             fprintf(stderr, "Unable to build Ether header: %s\n", libnet_geterror(s_netctx));
             exit(1);
@@ -219,12 +223,17 @@ static void send_syn(in_addr_t src_ipaddr, int src_port, in_addr_t dst_ipaddr, i
         ++s_sent_failed;
     }
 
-    libnet_clear_packet(s_netctx);
+    //libnet_clear_packet(s_netctx);
 }
 
 static void init_net_context(int inj_type)
 {
     char libnet_errbuf[LIBNET_ERRBUF_SIZE];    /* libnet error messages */
+    s_tcpopt = 0;
+    s_tcp = 0;
+    s_ipv4 = 0;
+    s_ether = 0;
+    
     s_netctx = libnet_init(inj_type, s_user_specified_device, libnet_errbuf);
     if (s_netctx == NULL)
     {
@@ -246,6 +255,11 @@ static void init_net_context(int inj_type)
         fprintf(stderr, "Device is NULL. Packet capture may be broken\n");
     }
     
+    if ((s_src_macaddr = (uint8_t*)libnet_get_hwaddr(s_netctx)) == NULL)
+    {
+        fprintf(stderr, "Get device MAC address error: %s", libnet_geterror(s_netctx));
+    }
+    
     printf("Device: %s\n", s_device_name);
 }
 
@@ -260,12 +274,12 @@ static void *send_thread(void *arg)
     {
         for ( i = 0; i < s_total_ip; ++i)
         {
-            if (s_require_update_netctx)
+            if (!s_netctx_gateway_macaddr_set && s_gateway_macaddr_set)
             {
                 libnet_destroy(s_netctx);
                 init_net_context(LIBNET_LINK);
                 printf("Gateway MAC addr set\n");
-                s_require_update_netctx = 0;
+                s_netctx_gateway_macaddr_set = 1;
             }
             send_syn(s_src_ipaddr, 
                     libnet_get_prand(LIBNET_PRu16), 
