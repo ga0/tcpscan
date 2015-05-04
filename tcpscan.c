@@ -24,7 +24,7 @@ static int s_send_syn_thread_quit = 0;
 static unsigned int s_interval_us = 0;
 static unsigned int s_max_wait_time = 5;
 static int s_netprefix_length = 0;
-static const u_int32_t INIT_ISN = 11341;
+static u_int32_t INIT_ISN = 0;
 static const char* s_user_specified_device = NULL;
 static const char* s_device_name;
 static int s_gateway_macaddr_set = 0;
@@ -396,6 +396,7 @@ int main (int argc, char *argv[])
         }
     }
 
+    INIT_ISN = libnet_get_prand(LIBNET_PRu32);
     init_net_context(LIBNET_RAW4);
     init_task(argv[optind]);
     snprintf(filter, sizeof filter, "(dst host %s) && tcp[8:4] == %d", libnet_addr2name4(s_src_ipaddr, LIBNET_DONT_RESOLVE), INIT_ISN + 1);
